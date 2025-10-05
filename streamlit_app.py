@@ -1,101 +1,168 @@
-import streamlit as st
-import google.generativeai as genai
-import json
+import io
 import os
+import zipfile
+import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import List, Tuple
 
-# Configure the API key securely from Streamlit's secrets
-# Ensure GOOGLE_API_KEY is added in secrets.toml (for local) or Streamlit Cloud Secrets
-genai.configure(api_key=st.secrets["GOOGLE_API_KEY"])
+import streamlit as st
+from pdfminer.high_level import extract_text
 
-# Streamlit App UI
-st.title("Instant Bot Builder")
-st.write("Create your own AI-powered bot for various purposes like sales, support, and social media management.")
 
-# Step 1: Choose a bot template
-bot_templates = {
-    "Sales Bot": "This bot helps engage customers and drive sales through personalized interactions.",
-    "Support Bot": "This bot assists in customer support, answering queries and troubleshooting problems.",
-    "Social Media Bot": "This bot manages and interacts with social media accounts, posting updates and responding to comments."
-}
+# -----------------------
+# Helper functions
+# -----------------------
 
-# Dropdown for selecting the bot template
-selected_template = st.selectbox("Select a Bot Template:", list(bot_templates.keys()))
-
-# Step 2: Customize bot settings
-if selected_template:
-    st.subheader(f"Customize Your {selected_template}")
-    if selected_template == "Sales Bot":
-        tone = st.radio("Choose the tone of the bot:", ["Friendly", "Professional", "Casual"])
-        primary_goal = st.selectbox("Select the primary goal:", ["Lead Generation", "Product Inquiry", "Customer Retention"])
-    elif selected_template == "Support Bot":
-        response_type = st.selectbox("Select response type:", ["FAQ", "Troubleshooting", "Product Issues"])
-        urgency_level = st.radio("Response urgency level:", ["Immediate", "Within an hour", "End of the day"])
-    elif selected_template == "Social Media Bot":
-        interaction_type = st.selectbox("Select interaction type:", ["Post Scheduling", "Comment Replying", "DM Responses"])
-        platform = st.selectbox("Select platform:", ["Instagram", "Twitter", "Facebook"])
-
-# Step 3: Generate bot script
-if st.button("Generate Bot"):
+def extract_text_pdfminer(pdf_bytes: bytes, page_numbers: List[int] = None) -> str:
+    """
+    Extract text using pdfminer.six. This works well for digital (embedded-text) PDFs.
+    """
     try:
-        # Prepare the prompt based on user input
-        prompt = f"Create a bot for {selected_template}. "
-        
-        # Add customizations to the prompt
-        if selected_template == "Sales Bot":
-            prompt += f"The bot should have a {tone} tone and focus on {primary_goal}."
-        elif selected_template == "Support Bot":
-            prompt += f"The bot should handle {response_type} with a response urgency of {urgency_level}."
-        elif selected_template == "Social Media Bot":
-            prompt += f"The bot should focus on {interaction_type} on {platform}."
-        
-        # Generate the bot's script using Gemini's model
-        model = genai.GenerativeModel('gemini-1.5-flash')
-        response = model.generate_content(prompt)
-        
-        # Display the bot's script
-        st.subheader("Generated Bot Script:")
-        bot_script = response.text
-        st.write(bot_script)
-        
-        # Step 4: Test the generated bot
-        st.subheader("Test Your Bot:")
-        user_input = st.text_input("Ask your bot a question:", "What is your return policy?")
-        if user_input:
-            bot_response = model.generate_content(f"Bot script: {bot_script} User input: {user_input}")
-            st.write(f"Bot's Response: {bot_response.text}")
-        
-        # Step 5: Save and Export Bot
-        save_button = st.button("Save Bot Script")
-        if save_button:
-            # Save bot script to a file (JSON format)
-            bot_name = st.text_input("Enter a name for your bot:", "MyBot")
-            if bot_name:
-                bot_data = {
-                    "name": bot_name,
-                    "template": selected_template,
-                    "customizations": {
-                        "tone": tone if selected_template == "Sales Bot" else None,
-                        "primary_goal": primary_goal if selected_template == "Sales Bot" else None,
-                        "response_type": response_type if selected_template == "Support Bot" else None,
-                        "urgency_level": urgency_level if selected_template == "Support Bot" else None,
-                        "interaction_type": interaction_type if selected_template == "Social Media Bot" else None,
-                        "platform": platform if selected_template == "Social Media Bot" else None
-                    },
-                    "script": bot_script
-                }
-                
-                # Export the bot to a JSON file
-                file_name = f"{bot_name}.json"
-                with open(file_name, 'w') as f:
-                    json.dump(bot_data, f, indent=4)
-                st.success(f"Bot '{bot_name}' saved successfully as {file_name}")
-                
-                # Provide option to download the file
-                with open(file_name, "r") as file:
-                    st.download_button(label="Download Bot Script", data=file, file_name=file_name, mime="application/json")
-                
-                # Option to remove file after download
-                os.remove(file_name)
-        
-    except Exception as e:
-        st.error(f"Error: {e}")
+        with tempfile.NamedTemporaryFile(delete=True, suffix=".pdf") as tmp:
+            tmp.write(pdf_bytes)
+            tmp.flush()
+            txt = extract_text(tmp.name, page_numbers=page_numbers)
+        return txt or ""
+    except Exception:
+        return ""
+
+
+def process_single_file(file_obj) -> Tuple[str, str, bytes]:
+    """
+    Process a single uploaded PDF file and return (filename, method, text_bytes).
+    """
+    filename = file_obj.name
+    pdf_bytes = file_obj.read()
+    txt = extract_text_pdfminer(pdf_bytes)
+    method = "pdfminer" if txt.strip() else "failed"
+    text_bytes = txt.encode("utf-8", errors="ignore")
+    return filename, method, text_bytes
+
+
+def make_zip_in_memory(results: List[Tuple[str, bytes]]) -> bytes:
+    """
+    Given list of (filename, bytes) create an in-memory zip and return bytes.
+    Filenames are the base original name replaced with .txt
+    """
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for orig_name, data in results:
+            base = os.path.splitext(orig_name)[0]
+            txt_name = base + ".txt"
+            z.writestr(txt_name, data)
+    buf.seek(0)
+    return buf.read()
+
+
+# -----------------------
+# Streamlit UI
+# -----------------------
+
+st.set_page_config(page_title="PDF → Text Converter", layout="wide", page_icon="📄➡️📝")
+st.title("📄 → 📝 PDF to Text — Precise, Powerful, Accurate")
+
+st.markdown(
+    """
+A lightweight Streamlit app to convert PDFs to plain text.  
+- Uses **pdfminer.six** for accurate text extraction.  
+- Supports bulk processing + parallel workers + ZIP download.  
+- Skips OCR and images entirely — for **digital PDFs only**.
+"""
+)
+
+with st.sidebar:
+    st.header("Options")
+    workers = st.number_input(
+        "Parallel workers (bulk)", min_value=1, max_value=16, value=4,
+        help="Number of threads for bulk processing."
+    )
+    out_single = st.selectbox(
+        "When a single file is uploaded — show",
+        ["Preview & Download .txt", "Direct .txt Download"],
+        index=0
+    )
+
+uploaded = st.file_uploader("Upload one or multiple PDF files", type=["pdf"], accept_multiple_files=True)
+if not uploaded:
+    st.info("Upload at least one PDF file to begin.")
+    st.stop()
+
+# Processing area
+st.subheader("Processing")
+
+progress_bar = st.progress(0)
+status_area = st.empty()
+log_area = st.empty()
+
+results = []  # (filename, text_bytes, method)
+errors = []
+
+total_files = len(uploaded)
+status_area.info(f"Queued {total_files} file(s) for processing — starting...")
+
+# Parallel processing
+with ThreadPoolExecutor(max_workers=int(workers)) as executor:
+    future_to_name = {}
+    for f in uploaded:
+        future = executor.submit(process_single_file, f)
+        future_to_name[future] = f.name
+
+    done_count = 0
+    for future in as_completed(future_to_name):
+        name = future_to_name[future]
+        try:
+            filename, method, text_bytes = future.result()
+            results.append((filename, text_bytes, method))
+            log_area.text(f"✔ {filename} → {method} ({len(text_bytes)} bytes)")
+        except Exception as e:
+            errors.append((name, str(e)))
+            log_area.text(f"✖ {name} failed: {e}")
+        done_count += 1
+        progress_bar.progress(done_count / total_files)
+
+# Show summary
+st.success(f"Processed {len(results)} / {total_files} files.")
+if errors:
+    st.error(f"{len(errors)} file(s) failed.")
+    for n, reason in errors:
+        st.write(f"- {n}: {reason}")
+
+# Single file OR bulk
+if len(results) == 1:
+    name, data, method = results[0]
+    st.markdown(f"**File:** `{name}` — **Method:** {method}")
+    text = data.decode("utf-8", errors="replace")
+    if out_single == "Preview & Download .txt":
+        st.text_area("Extracted text (preview)", value=text, height=400)
+        st.download_button(
+            "Download extracted .txt",
+            data,
+            file_name=os.path.splitext(name)[0] + ".txt",
+            mime="text/plain"
+        )
+    else:
+        st.download_button(
+            "Download extracted .txt",
+            data,
+            file_name=os.path.splitext(name)[0] + ".txt",
+            mime="text/plain"
+        )
+else:
+    import pandas as pd
+    df = pd.DataFrame([{"filename": fn, "method": m, "size_bytes": len(b)} for fn, b, m in results])
+    st.table(df)
+
+    zipped = make_zip_in_memory([(fn, b) for fn, b, m in results])
+    st.download_button("Download all results as ZIP", zipped, file_name="pdf_texts.zip", mime="application/zip")
+
+    st.markdown("**Individual downloads**")
+    for fn, b, m in results:
+        st.download_button(
+            f"Download {os.path.splitext(fn)[0]}.txt",
+            b,
+            file_name=os.path.splitext(fn)[0] + ".txt",
+            key=f"dl_{fn}"
+        )
+
+st.markdown("---")
+st.caption("Built with pdfminer.six for clean digital PDF text extraction. OCR skipped.")
